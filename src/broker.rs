@@ -166,6 +166,12 @@ impl BrokerClient {
         })
     }
 
+    /// Registers the device, discarding the status (see [`Self::register_and_status`]).
+    pub async fn register(&self) -> Result<(), BrokerError> {
+        let _ = self.register_and_status().await?;
+        Ok(())
+    }
+
     /// Queries the broker for the current device status.
     ///
     /// Note: the broker's `/api/devices/status` endpoint long-polls while the

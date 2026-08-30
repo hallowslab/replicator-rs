@@ -4,6 +4,7 @@ pub mod store;
 #[cfg(feature = "broker")]
 pub mod broker;
 pub mod consumer;
+pub mod event;
 
 pub use config::{
     BackendConfig, BackgroundJobConfig, FtpsConfig, RemoteStorageConfig, S3Config,
@@ -16,3 +17,4 @@ pub use store::{RecordStatus, ReplicationRecord, ReplicationStore};
 #[cfg(feature = "broker")]
 pub use broker::{BrokerClient, BrokerError, DeviceStatus, generate_device_key};
 pub use consumer::Consumer;
+pub use event::ReplicatorEvent;

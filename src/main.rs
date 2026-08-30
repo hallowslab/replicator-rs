@@ -34,7 +34,7 @@ async fn main() -> Result<(), String> {
         store.pending_count()?
     );
 
-    let consumer = Consumer::new(&config, store).await?;
+    let consumer = Consumer::new(&config, store, None);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
