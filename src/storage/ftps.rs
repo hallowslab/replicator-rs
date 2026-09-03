@@ -214,9 +214,9 @@ impl FtpsBackend {
 
 #[async_trait]
 impl StorageBackend for FtpsBackend {
-    async fn upload(&self, source_path: &Path, dest_path: &str) -> Result<(), StorageError> {
+    async fn upload(&self, source_path: &Path, dest_key: &str) -> Result<(), StorageError> {
         let mut conn = self.connect().await?;
-        let remote = self.remote_path(dest_path);
+        let remote = dest_key.to_string();
 
         let parent = std::path::Path::new(&remote)
             .parent()
@@ -236,6 +236,10 @@ impl StorageBackend for FtpsBackend {
 
         conn.quit().await;
         Ok(())
+    }
+
+    fn resolve_key(&self, path: &str) -> String {
+        self.remote_path(path)
     }
 
     async fn delete(&self, path: &str) -> Result<(), StorageError> {

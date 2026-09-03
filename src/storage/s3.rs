@@ -318,18 +318,21 @@ fn build_http_client(config: &S3Config) -> Result<SharedHttpClient, StorageError
 
 #[async_trait]
 impl StorageBackend for S3Backend {
-    async fn upload(&self, source_path: &Path, dest_path: &str) -> Result<(), StorageError> {
-        let key = self.object_key(dest_path);
+    async fn upload(&self, source_path: &Path, dest_key: &str) -> Result<(), StorageError> {
         let size = tokio::fs::metadata(source_path)
             .await
             .map_err(StorageError::Io)?
             .len();
 
         if size <= self.multipart_threshold() {
-            self.single_upload(source_path, &key).await
+            self.single_upload(source_path, dest_key).await
         } else {
-            self.multipart_upload(source_path, &key, size).await
+            self.multipart_upload(source_path, dest_key, size).await
         }
+    }
+
+    fn resolve_key(&self, path: &str) -> String {
+        self.object_key(path)
     }
 
     async fn delete(&self, path: &str) -> Result<(), StorageError> {

@@ -12,13 +12,17 @@ use crate::broker::{BrokerClient, DeviceStatus};
 #[cfg(feature = "broker")]
 use crate::config::BrokerConfig;
 
+/// Give up on a record after this long (from its `created_at`) and mark it a
+/// dead-letter rather than retrying forever.
+const MAX_AGE_SECS: u64 = 72 * 3600;
+
 /// Long-running replicator: on start it authorizes with the broker (or builds a
 /// static backend), then drains the durable store until shut down.
 pub struct Consumer {
     store: ReplicationStore,
     config: BackgroundJobConfig,
     tx: Option<mpsc::UnboundedSender<ReplicatorEvent>>,
-    max_retries: u32,
+    retry_delay_secs: u64,
     poll_interval: Duration,
 }
 
@@ -32,7 +36,7 @@ impl Consumer {
             store,
             config: config.clone(),
             tx,
-            max_retries: config.max_retries,
+            retry_delay_secs: config.retry_delay_base.as_secs().max(1),
             poll_interval: config.retry_delay_base,
         }
     }
@@ -44,6 +48,11 @@ impl Consumer {
     }
 
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) {
+        // Recover from a previous run: interrupted uploads + dead-letters are
+        // retried.
+        let _ = self.store.resume_inflight();
+        let _ = self.store.reset_failed();
+
         let (backend, print_messages) = match build_backend(&self.config, self.tx.as_ref()).await {
             Ok(b) => b,
             Err(e) => {
@@ -63,20 +72,48 @@ impl Consumer {
             match self.store.next_pending() {
                 Ok(Some(rec)) => {
                     let source = std::path::PathBuf::from(&rec.source_path);
-                    match backend.upload(&source, &rec.dest_key).await {
+
+                    // Source file gone locally -> nothing left to replicate, drop it.
+                    if !source.exists() {
+                        eprintln!(
+                            "[Replicator] source gone, dropping record {}: {}",
+                            rec.id, rec.source_path
+                        );
+                        self.emit(ReplicatorEvent::Replication {
+                            path: rec.dest_key.clone(),
+                            ok: false,
+                            error: Some("source file missing".into()),
+                        });
+                        let _ = self.store.remove(rec.id);
+                        continue;
+                    }
+
+                    let dest_key = if rec.key_finalized {
+                        rec.dest_key.clone()
+                    } else {
+                        let key = backend.resolve_key(&rec.dest_path);
+                        if let Err(e) = self.store.finalize_key(rec.id, &key) {
+                            eprintln!(
+                                "[Replicator] failed to finalize key for {}: {}",
+                                rec.source_path, e
+                            );
+                        }
+                        key
+                    };
+                    match backend.upload(&source, &dest_key).await {
                         Ok(()) => {
                             if print_messages {
                                 println!(
                                     "[Replicator] replicated {} -> {}",
-                                    rec.source_path, rec.dest_key
+                                    rec.source_path, dest_key
                                 );
                             }
                             self.emit(ReplicatorEvent::Replication {
-                                path: rec.dest_key.clone(),
+                                path: dest_key.clone(),
                                 ok: true,
                                 error: None,
                             });
-                            let _ = self.store.mark_done(rec.id);
+                            let _ = self.store.remove(rec.id);
                         }
                         Err(e) => {
                             let message = e.to_string();
@@ -85,11 +122,11 @@ impl Consumer {
                                 rec.source_path, rec.attempts, message
                             );
                             self.emit(ReplicatorEvent::Replication {
-                                path: rec.dest_key.clone(),
+                                path: dest_key.clone(),
                                 ok: false,
                                 error: Some(message),
                             });
-                            let _ = self.store.mark_failed(rec.id, self.max_retries);
+                            let _ = self.store.mark_failed(rec.id, self.retry_delay_secs, MAX_AGE_SECS);
                         }
                     }
                 }

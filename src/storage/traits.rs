@@ -36,9 +36,17 @@ impl StorageError {
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
-    async fn upload(&self, source_path: &Path, dest_path: &str) -> Result<(), StorageError>;
+    /// Uploads `source_path` to the exact `dest_key` (already resolved via
+    /// [`StorageBackend::resolve_key`]).
+    async fn upload(&self, source_path: &Path, dest_key: &str) -> Result<(), StorageError>;
     async fn delete(&self, path: &str) -> Result<(), StorageError>;
     fn name(&self) -> &str;
+    /// Resolves a logical destination path into the final storage key. Callers
+    /// invoke this once per record and reuse the result, so non-deterministic
+    /// transformations (e.g. `immutable_naming` UUIDs) are only applied once.
+    fn resolve_key(&self, path: &str) -> String {
+        path.to_string()
+    }
     fn capabilities(&self) -> Option<&dyn BackendCapabilities> {
         None
     }

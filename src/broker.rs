@@ -287,7 +287,7 @@ pub fn parse_fetch_payload(resp: &serde_json::Value) -> Result<VersionedBackendC
         port: resp.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
         username: str_field(resp, "user"),
         password: str_field(resp, "password"),
-        path_prefix: str_field(resp, "root"),
+        path_prefix: prefix_field(resp, "root"),
         use_ssl: protocol == "ftps",
         ca_cert: None,
         ca_cert_pem: resp.get("ca_cert").and_then(|c| c.as_str()).map(str::to_string),
@@ -327,7 +327,7 @@ fn parse_backend(value: &serde_json::Value) -> Result<BackendConfig, BrokerError
                 access_key_id,
                 secret_access_key,
                 session_token: opt_str_field(value, "session_token"),
-                path_prefix: str_field(value, "root"),
+                path_prefix: prefix_field(value, "root"),
                 ca_cert_pem: opt_str_field(value, "ca_cert"),
                 multipart_threshold_bytes: None,
                 immutable_naming: value
@@ -359,7 +359,7 @@ fn parse_backend(value: &serde_json::Value) -> Result<BackendConfig, BrokerError
                 port: value.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
                 username,
                 password: str_field(value, "password"),
-                path_prefix: str_field(value, "root"),
+                path_prefix: prefix_field(value, "root"),
                 use_ssl,
                 ca_cert: None,
                 ca_cert_pem: opt_str_field(value, "ca_cert"),
@@ -381,6 +381,18 @@ fn str_field(value: &serde_json::Value, key: &str) -> String {
 
 fn opt_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// Reads an optional path/prefix field, tolerating brokers that stored the
+/// literal string "None" (or "null") instead of JSON null.
+fn prefix_field(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none") && !s.eq_ignore_ascii_case("null"))
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Generates a fresh hex-encoded Ed25519 device seed (same as `rftps broker keygen`).
