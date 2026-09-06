@@ -297,9 +297,10 @@ impl S3Backend {
 
 fn build_http_client(config: &S3Config) -> Result<SharedHttpClient, StorageError> {
     let tls_context = if let Some(ca_pem) = &config.ca_cert_pem {
-        let trust_store = TrustStore::empty().with_pem_certificate(ca_pem.as_bytes().to_vec());
+        let mut store = TrustStore::default();
+        store.add_pem_certificate(ca_pem.as_bytes().to_vec());
         tls::TlsContext::builder()
-            .with_trust_store(trust_store)
+            .with_trust_store(store)
             .build()
             .map_err(|e| StorageError::Config(format!("failed to build TLS context: {}", e)))?
     } else {
