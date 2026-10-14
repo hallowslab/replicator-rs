@@ -1,0 +1,13 @@
+# Replicator build-time defaults - baked into the replicator crate by build.rs.
+# Every binary that links replicator (the standalone replicator-rs CLI AND the
+# ExifFlow GUI) inherits these. Runtime config (bg.json / broker storage config)
+# and CLI args (--multipart-threshold / --max-part-size) override them.
+
+[s3]
+# Upload strategy (bytes). Files above `multipart_threshold_bytes` are uploaded
+# with S3 multipart; each part is capped at `max_part_size_bytes`.
+#
+# Safe defaults keep every request body well under Cloudflare's 100 MB proxied
+# upload cap. Must stay below 100 MB (104_857_600) to avoid 413 errors.
+multipart_threshold_bytes = 8388608    # 8 MiB - multipart above this size
+max_part_size_bytes = 52428800         # 50 MiB - per-part ceiling

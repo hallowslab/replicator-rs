@@ -29,6 +29,18 @@ pub struct ReplicationRecord {
     pub key_finalized: bool,
     pub status: RecordStatus,
     pub attempts: u32,
+    /// In-progress multipart upload id, persisted so a retry resumes it.
+    pub mp_upload_id: Option<String>,
+    /// Completed (part_number, etag) pairs, persisted between attempts.
+    pub mp_parts: Vec<(i32, String)>,
+}
+
+fn mp_parts_to_json(parts: &[(i32, String)]) -> String {
+    serde_json::to_string(parts).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn mp_parts_from_json(raw: &str) -> Vec<(i32, String)> {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn now_unix() -> i64 {
@@ -72,11 +84,30 @@ impl ReplicationStore {
                  attempts INTEGER NOT NULL DEFAULT 0,
                  next_retry_at INTEGER NOT NULL DEFAULT 0,
                  created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
+                 updated_at INTEGER NOT NULL,
+                 mp_upload_id TEXT,
+                 mp_parts TEXT NOT NULL DEFAULT '[]'
              );
              CREATE INDEX IF NOT EXISTS idx_status ON replication_records(status);",
         )
         .map_err(|e| e.to_string())?;
+
+        // Migration for databases created before resumable multipart existed.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(replication_records)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        if !cols.iter().any(|c| c == "mp_upload_id") {
+            conn.execute_batch(
+                "ALTER TABLE replication_records ADD COLUMN mp_upload_id TEXT;
+                 ALTER TABLE replication_records ADD COLUMN mp_parts TEXT NOT NULL DEFAULT '[]';",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -106,12 +137,15 @@ impl ReplicationStore {
             .map_err(|e| e.to_string())?;
         let rec = tx
             .query_row(
-                "SELECT id, source_path, dest_path, dest_key, key_finalized, attempts
+                "SELECT id, source_path, dest_path, dest_key, key_finalized, attempts,
+                        COALESCE(mp_upload_id, ''), COALESCE(mp_parts, '[]')
                  FROM replication_records
                  WHERE status = 'pending' AND next_retry_at <= ?1
                  ORDER BY id ASC LIMIT 1",
                 [now_unix()],
                 |row| {
+                    let mp_upload_id: String = row.get(6)?;
+                    let mp_parts_raw: String = row.get(7)?;
                     Ok(ReplicationRecord {
                         id: row.get(0)?,
                         source_path: row.get(1)?,
@@ -120,6 +154,12 @@ impl ReplicationStore {
                         key_finalized: row.get(4)?,
                         status: RecordStatus::InFlight,
                         attempts: row.get(5)?,
+                        mp_upload_id: if mp_upload_id.is_empty() {
+                            None
+                        } else {
+                            Some(mp_upload_id)
+                        },
+                        mp_parts: mp_parts_from_json(&mp_parts_raw),
                     })
                 },
             )
@@ -154,7 +194,7 @@ impl ReplicationStore {
     /// exponential backoff (`retry_delay_secs * 2^(attempts-1)`, capped at 1h).
     ///
     /// If the record is older than `max_age_secs` (measured from `created_at`),
-    /// it is instead marked `failed` as a dead-letter — kept visible so the
+    /// it is instead marked `failed` as a dead-letter - kept visible so the
     /// operator can see what failed, and resettable via [`Self::reset_failed`].
     pub fn mark_failed(&self, id: i64, retry_delay_secs: u64, max_age_secs: u64) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
@@ -207,6 +247,24 @@ impl ReplicationStore {
         conn.execute(
             "UPDATE replication_records SET dest_key = ?1, key_finalized = 1, updated_at = ?2 WHERE id = ?3",
             params![dest_key, now_unix(), id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Persists resumable-multipart state (upload id + completed parts) so a
+    /// failed attempt resumes from where it stopped. Called after every upload
+    /// attempt; values are cleared by the caller when the upload completes.
+    pub fn save_upload_state(
+        &self,
+        id: i64,
+        mp_upload_id: Option<&str>,
+        parts: &[(i32, String)],
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE replication_records SET mp_upload_id = ?1, mp_parts = ?2, updated_at = ?3 WHERE id = ?4",
+            params![mp_upload_id, mp_parts_to_json(parts), now_unix(), id],
         )
         .map_err(|e| e.to_string())?;
         Ok(())

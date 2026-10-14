@@ -1,3 +1,6 @@
+// Build-time defaults baked from build.toml (see build.rs).
+include!(concat!(env!("OUT_DIR"), "/replicator_defaults.rs"));
+
 pub mod config;
 pub mod storage;
 pub mod store;

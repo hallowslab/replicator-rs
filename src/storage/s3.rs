@@ -1,16 +1,21 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, SharedHttpClient};
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_http_client::tls::{self, TrustStore};
 use aws_smithy_types::retry::RetryConfig;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
-use super::traits::{BackendCapabilities, Capability, StorageBackend, StorageError};
+use super::traits::{
+    BackendCapabilities, Capability, StorageBackend, StorageError, UploadContext,
+};
 use crate::config::S3Config;
 
 const S3_KEY_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
@@ -23,13 +28,21 @@ fn generate_immutable_prefix() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 8 * 1024 * 1024;
+// Defaults are baked at build time from replicator-rs/build.toml (build.rs).
+// They apply whenever the storage/broker config leaves the field unset.
+pub const DEFAULT_MULTIPART_THRESHOLD: u64 = crate::S3_DEFAULT_MULTIPART_THRESHOLD_BYTES;
+pub const DEFAULT_MAX_PART_SIZE: u64 = crate::S3_DEFAULT_MAX_PART_SIZE_BYTES;
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const MAX_PART_COUNT: u64 = 10_000;
 
-pub fn plan_part_size(size: u64) -> u64 {
-    let by_count = size.div_ceil(MAX_PART_COUNT);
-    by_count.max(MIN_PART_SIZE)
+/// Pick a part size for `size`: as small as needed to stay under
+/// `MAX_PART_COUNT`, never below `MIN_PART_SIZE`, never above `max_part`.
+/// `max_part` keeps every request body under Cloudflare's proxied upload cap
+/// (100 MB on Free) regardless of file size.
+pub fn plan_part_size(size: u64, max_part: u64) -> u64 {
+    let max_part = max_part.max(MIN_PART_SIZE);
+    size.div_ceil(MAX_PART_COUNT)
+        .clamp(MIN_PART_SIZE, max_part)
 }
 
 pub struct S3Backend {
@@ -55,7 +68,17 @@ impl S3Backend {
             .credentials_provider(credentials)
             .force_path_style(config.path_style)
             .http_client(http_client)
-            .retry_config(RetryConfig::disabled());
+            .retry_config(RetryConfig::disabled())
+            // Per-request bounds. NOTE: aws-smithy's read_timeout is a FIXED
+            // deadline for the whole service call (body write + response head),
+            // NOT inactivity-based. Sized for the largest request body:
+            // 50 MiB part @ 50 KiB/s ~ 17 min, 1.8x margin => 30 min.
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(15))
+                    .read_timeout(Duration::from_secs(30 * 60))
+                    .build(),
+            );
 
         if let Some(region) = &config.region {
             builder = builder.region(Region::new(region.clone()));
@@ -108,6 +131,12 @@ impl S3Backend {
             .unwrap_or(DEFAULT_MULTIPART_THRESHOLD)
     }
 
+    pub fn max_part_size(&self) -> u64 {
+        self.config
+            .max_part_size_bytes
+            .unwrap_or(DEFAULT_MAX_PART_SIZE)
+    }
+
     async fn single_upload(&self, source_path: &Path, key: &str) -> Result<(), StorageError> {
         let body = ByteStream::from_path(source_path)
             .await
@@ -124,35 +153,38 @@ impl S3Backend {
             .map_err(|e| self.map_sdk_error(e, "upload", key))
     }
 
+    /// Uploads the parts of `key` missing from `ctx.parts` (parts already
+    /// persisted as completed are skipped) and appends each new
+    /// (part_number, etag) to the context so a later attempt resumes from
+    /// exactly this point.
     async fn upload_parts(
         &self,
         source_path: &Path,
         key: &str,
         upload_id: &str,
         part_size: u64,
-    ) -> Result<Vec<CompletedPart>, StorageError> {
+        size: u64,
+        ctx: &mut UploadContext,
+    ) -> Result<(), StorageError> {
+        let part_count = size.div_ceil(part_size);
+        let done: HashMap<i32, String> = ctx.parts.iter().cloned().collect();
         let mut file = tokio::fs::File::open(source_path)
             .await
             .map_err(StorageError::Io)?;
-        let mut completed = Vec::new();
-        let mut buf = vec![0u8; part_size as usize];
-        let mut part_number: i32 = 1;
 
-        loop {
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                let n = file.read(&mut buf[filled..]).await.map_err(StorageError::Io)?;
-                if n == 0 {
-                    break;
-                }
-                filled += n;
+        for part_number in 1..=part_count as i32 {
+            if done.contains_key(&part_number) {
+                continue;
             }
-            if filled == 0 {
-                break;
-            }
-            buf.truncate(filled);
-            let body = ByteStream::from(std::mem::take(&mut buf));
-            buf.resize(part_size as usize, 0);
+            let start = (part_number as u64 - 1) * part_size;
+            let len = (size - start).min(part_size);
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(StorageError::Io)?;
+            let mut body = vec![0u8; len as usize];
+            file.read_exact(&mut body)
+                .await
+                .map_err(StorageError::Io)?;
 
             let resp = self
                 .client
@@ -161,7 +193,7 @@ impl S3Backend {
                 .key(key)
                 .upload_id(upload_id)
                 .part_number(part_number)
-                .body(body)
+                .body(ByteStream::from(body))
                 .send()
                 .await
                 .map_err(|e| self.map_sdk_error(e, "upload part", key))?;
@@ -175,16 +207,11 @@ impl S3Backend {
                     ))
                 })?
                 .to_string();
-            completed.push(
-                CompletedPart::builder()
-                    .e_tag(etag)
-                    .part_number(part_number)
-                    .build(),
-            );
-            part_number += 1;
+            ctx.parts.push((part_number, etag));
+            ctx.notify_progress();
         }
 
-        Ok(completed)
+        Ok(())
     }
 
     async fn multipart_upload(
@@ -192,53 +219,80 @@ impl S3Backend {
         source_path: &Path,
         key: &str,
         size: u64,
+        ctx: &mut UploadContext,
     ) -> Result<(), StorageError> {
-        let part_size = plan_part_size(size);
+        let part_size = plan_part_size(size, self.max_part_size());
 
-        let create = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.config.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| self.map_sdk_error(e, "create multipart upload", key))?;
-        let upload_id = create.upload_id().ok_or_else(|| {
-            StorageError::Transfer(format!(
-                "S3 create multipart upload returned no upload id for '{}'",
-                key
-            ))
-        })?;
-
-        let parts = match self.upload_parts(source_path, key, upload_id, part_size).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                let _ = self
+        let upload_id = match &ctx.multipart_upload_id {
+            Some(id) => id.clone(),
+            None => {
+                let create = self
                     .client
-                    .abort_multipart_upload()
+                    .create_multipart_upload()
                     .bucket(&self.config.bucket)
                     .key(key)
-                    .upload_id(upload_id)
                     .send()
-                    .await;
-                return Err(err);
+                    .await
+                    .map_err(|e| self.map_sdk_error(e, "create multipart upload", key))?;
+                let id = create.upload_id().ok_or_else(|| {
+                    StorageError::Transfer(format!(
+                        "S3 create multipart upload returned no upload id for '{}'",
+                        key
+                    ))
+                })?.to_string();
+                ctx.multipart_upload_id = Some(id.clone());
+                ctx.notify_progress();
+                id
             }
         };
 
-        let completed = parts.iter().fold(
+        self.upload_parts(source_path, key, &upload_id, part_size, size, ctx)
+            .await?;
+        // NOTE: on failure we intentionally do NOT abort. The multipart upload
+        // stays in-progress on the server and `ctx.parts` records what is
+        // already uploaded (persisted by the caller), so the next attempt
+        // resumes from the missing parts instead of restarting the whole file.
+        // Orphaned uploads are eventually GC'd by garage lifecycle/repair.
+
+        let completed = ctx.parts.iter().fold(
             CompletedMultipartUpload::builder(),
-            |builder, part| builder.parts(part.clone()),
-        );
-        self.client
+            |builder, (n, e)| {
+                builder.parts(
+                    CompletedPart::builder()
+                        .part_number(*n)
+                        .e_tag(e.clone())
+                        .build(),
+                )
+            },
+        ).build();
+
+        match self
+            .client
             .complete_multipart_upload()
             .bucket(&self.config.bucket)
             .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(completed.build())
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
             .send()
             .await
-            .map(|_| ())
-            .map_err(|e| self.map_sdk_error(e, "complete multipart upload", key))
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Server dropped the in-progress upload (expired/GC'd): reset
+                // so the next attempt starts a fresh multipart.
+                if let aws_sdk_s3::error::SdkError::ServiceError(se) = &e
+                    && se
+                        .err()
+                        .meta()
+                        .code()
+                        .map(|c| c == "NoSuchUpload")
+                        .unwrap_or(false)
+                {
+                    *ctx = UploadContext::default();
+                }
+                Err(self.map_sdk_error(e, "complete multipart upload", key))
+            }
+        }
     }
 
     fn map_sdk_error<E>(&self, err: aws_sdk_s3::error::SdkError<E>, op: &str, key: &str) -> StorageError
@@ -319,16 +373,24 @@ fn build_http_client(config: &S3Config) -> Result<SharedHttpClient, StorageError
 
 #[async_trait]
 impl StorageBackend for S3Backend {
-    async fn upload(&self, source_path: &Path, dest_key: &str) -> Result<(), StorageError> {
+    async fn upload(
+        &self,
+        source_path: &Path,
+        dest_key: &str,
+        ctx: &mut UploadContext,
+    ) -> Result<(), StorageError> {
         let size = tokio::fs::metadata(source_path)
             .await
             .map_err(StorageError::Io)?
             .len();
 
         if size <= self.multipart_threshold() {
+            // Single PutObject has no resumable state; discard any stale one
+            // (e.g. the source was replaced with a smaller file).
+            *ctx = UploadContext::default();
             self.single_upload(source_path, dest_key).await
         } else {
-            self.multipart_upload(source_path, dest_key, size).await
+            self.multipart_upload(source_path, dest_key, size, ctx).await
         }
     }
 

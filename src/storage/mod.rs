@@ -6,7 +6,8 @@ pub mod tls_utils;
 pub mod factory;
 
 pub use traits::{
-    BackendCapabilities, Capability, StorageBackend, StorageError, mkdir_on, rename_on,
+    BackendCapabilities, Capability, StorageBackend, StorageError, UploadContext, mkdir_on,
+    rename_on,
 };
 pub use ftps::FtpsBackend;
 #[cfg(feature = "s3")]

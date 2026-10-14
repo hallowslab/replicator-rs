@@ -1,0 +1,158 @@
+name: Rust Build and Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"  # Runs on versioned tags like v0.1.0
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    name: Set Matrix Targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set_targets.outputs.targets }}  # Make outputs available for subsequent jobs
+    steps:
+      - name: Set Matrix Targets
+        id: set_targets
+        # Target order
+        # 0 - Linux
+        # 1 - Apple X64
+        # 2 - Apple aarch64/ARM
+        # 3 - Windows
+        run: |
+          echo "targets=[\"x86_64-unknown-linux-gnu\",\"x86_64-apple-darwin\",\"aarch64-apple-darwin\",\"x86_64-pc-windows-msvc\"]" >> $GITHUB_OUTPUT
+
+  test:
+    name: Test for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[0] }}
+          - os: macos-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[1] }}
+          - os: macos-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[2] }}
+          - os: windows-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[3] }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Run tests (default - broker + s3)
+        run: |
+          echo "Running tests for ${{ matrix.target }} on ${{ matrix.os }}"
+          cargo test
+      - name: Run tests (ftps only)
+        run: |
+          echo "Running ftps-only tests for ${{ matrix.target }} on ${{ matrix.os }}"
+          cargo test --no-default-features
+
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: setup
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[0] }}
+            ext: ""
+            a_ext: ".tar.gz"
+          - os: macos-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[1] }}
+            ext: ""
+            a_ext: ".tar.gz"
+          - os: macos-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[2] }}
+            ext: ""
+            a_ext: ".tar.gz"
+          - os: windows-latest
+            target: ${{ fromJson(needs.setup.outputs.targets)[3] }}
+            ext: ".exe"
+            a_ext: ".zip"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Install UPX
+        if: ${{ contains(matrix.os, 'ubuntu') }}
+        run: sudo apt update && sudo apt install -y upx
+
+      - name: Install Rust Target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (full - broker + s3)
+        run: cargo build --release --target=${{ matrix.target }}
+
+      - name: Rename full executable
+        run: mv target/${{ matrix.target }}/release/replicator-rs${{ matrix.ext }} replicator-rs-full-${{ matrix.target }}${{ matrix.ext }}
+
+      - name: Build (ftps only)
+        run: cargo build --release --target=${{ matrix.target }} --no-default-features
+
+      - name: Rename ftps executable
+        run: mv target/${{ matrix.target }}/release/replicator-rs${{ matrix.ext }} replicator-rs-ftps-${{ matrix.target }}${{ matrix.ext }}
+
+      # Don't pack the windows executables AV will flag them
+      # Don't pack for macos, bad support
+      - name: Compress Executable with UPX
+        if: ${{ contains(matrix.os, 'ubuntu') }}
+        run: |
+          upx --best --lzma replicator-rs-full-${{ matrix.target }}${{ matrix.ext }}
+          upx --best --lzma replicator-rs-ftps-${{ matrix.target }}${{ matrix.ext }}
+
+      - name: Archive Files (Windows)
+        if: ${{ contains(matrix.os, 'windows') }}
+        shell: pwsh
+        run: |
+          Compress-Archive -Path replicator-rs-full-${{ matrix.target }}${{ matrix.ext }} -DestinationPath replicator-rs-full-${{ matrix.target }}${{ matrix.a_ext }}
+          Compress-Archive -Path replicator-rs-ftps-${{ matrix.target }}${{ matrix.ext }} -DestinationPath replicator-rs-ftps-${{ matrix.target }}${{ matrix.a_ext }}
+
+      - name: Archive Files (Linux/macOS)
+        if: ${{ !contains(matrix.os, 'windows') }}
+        run: |
+          tar -czvf replicator-rs-full-${{ matrix.target }}${{ matrix.a_ext }} replicator-rs-full-${{ matrix.target }}${{ matrix.ext }}
+          tar -czvf replicator-rs-ftps-${{ matrix.target }}${{ matrix.a_ext }} replicator-rs-ftps-${{ matrix.target }}${{ matrix.ext }}
+
+      - name: Upload Archived Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: replicator-rs-${{ matrix.target }}
+          path: |
+            replicator-rs-full-${{ matrix.target }}.zip
+            replicator-rs-ftps-${{ matrix.target }}.zip
+            replicator-rs-full-${{ matrix.target }}.tar.gz
+            replicator-rs-ftps-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.REPLICATOR }}
+          tag_name: ${{ github.ref_name }}
+          body_path: docs/releases/${{ github.ref_name }}.md
+          files: artifacts/**

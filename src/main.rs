@@ -23,6 +23,14 @@ struct Cli {
     /// Path to the replicator config (bg.json style)
     #[arg(long)]
     config: Option<String>,
+
+    /// Force multipart for files above this many bytes (overrides config)
+    #[arg(long)]
+    multipart_threshold: Option<u64>,
+
+    /// Cap each multipart part at this many bytes (default 50 MiB)
+    #[arg(long)]
+    max_part_size: Option<u64>,
 }
 
 #[cfg(feature = "broker")]
@@ -65,7 +73,13 @@ async fn main() -> Result<(), String> {
     let store = cli.store.ok_or("--store is required")?;
     let config = cli.config.ok_or("--config is required")?;
 
-    let config = BackgroundJobConfig::load_from_file(&config)?;
+    let mut config = BackgroundJobConfig::load_from_file(&config)?;
+    if cli.multipart_threshold.is_some() {
+        config.multipart_threshold_bytes = cli.multipart_threshold;
+    }
+    if cli.max_part_size.is_some() {
+        config.max_part_size_bytes = cli.max_part_size;
+    }
     let store = ReplicationStore::open(Path::new(&store))?;
 
     let resumed = store.resume_inflight()?;

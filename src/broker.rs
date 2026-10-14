@@ -150,7 +150,7 @@ impl BrokerClient {
 
     /// Registers the device and returns the current effective status.
     ///
-    /// Idempotent — the broker upserts by `public_key` and returns the existing
+    /// Idempotent - the broker upserts by `public_key` and returns the existing
     /// status for a known device (including `deauthorized`, which the caller must
     /// treat as non-recoverable).
     pub async fn register_and_status(&self) -> Result<DeviceStatus, BrokerError> {
@@ -329,7 +329,12 @@ fn parse_backend(value: &serde_json::Value) -> Result<BackendConfig, BrokerError
                 session_token: opt_str_field(value, "session_token"),
                 path_prefix: prefix_field(value, "root"),
                 ca_cert_pem: opt_str_field(value, "ca_cert"),
-                multipart_threshold_bytes: None,
+                multipart_threshold_bytes: value
+                    .get("multipart_threshold_bytes")
+                    .and_then(|v| v.as_u64()),
+                max_part_size_bytes: value
+                    .get("max_part_size_bytes")
+                    .and_then(|v| v.as_u64()),
                 immutable_naming: value
                     .get("immutable_naming")
                     .and_then(|p| p.as_bool())

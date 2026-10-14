@@ -12,6 +12,10 @@ pub struct BackgroundJobConfig {
     pub remote_storage: Option<RemoteStorageConfig>,
     pub storage: Option<VersionedBackendConfig>,
     pub user_mapping: UserMapping,
+    /// Force multipart for files above this size (overrides storage config).
+    pub multipart_threshold_bytes: Option<u64>,
+    /// Cap each multipart part at this size (overrides storage config).
+    pub max_part_size_bytes: Option<u64>,
     #[cfg(feature = "broker")]
     pub broker: Option<BrokerConfig>,
 }
@@ -27,6 +31,8 @@ impl Default for BackgroundJobConfig {
             remote_storage: None,
             storage: None,
             user_mapping: UserMapping::PrefixUserName,
+            multipart_threshold_bytes: None,
+            max_part_size_bytes: None,
             #[cfg(feature = "broker")]
             broker: None,
         }
@@ -118,6 +124,7 @@ pub struct S3Config {
     pub path_prefix: String,
     pub ca_cert_pem: Option<String>,
     pub multipart_threshold_bytes: Option<u64>,
+    pub max_part_size_bytes: Option<u64>,
     pub immutable_naming: bool,
 }
 
@@ -134,6 +141,7 @@ impl Default for S3Config {
             path_prefix: String::new(),
             ca_cert_pem: None,
             multipart_threshold_bytes: None,
+            max_part_size_bytes: None,
             immutable_naming: false,
         }
     }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use suppaftp::tokio::{AsyncFtpStream, AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::types::FileType;
 
-use super::traits::{BackendCapabilities, Capability, StorageBackend, StorageError};
+use super::traits::{BackendCapabilities, Capability, StorageBackend, StorageError, UploadContext};
 use super::tls_utils::NoCertificateVerification;
 use crate::config::FtpsConfig;
 
@@ -128,7 +128,7 @@ impl FtpsBackend {
 
         let mut conn = if self.config.use_ssl {
             let tls_config = if self.config.danger_disable_cert_verify {
-                eprintln!("[FTPS] WARNING: certificate verification is disabled — DO NOT use in production");
+                eprintln!("[FTPS] WARNING: certificate verification is disabled - DO NOT use in production");
                 rustls::ClientConfig::builder()
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
@@ -214,7 +214,12 @@ impl FtpsBackend {
 
 #[async_trait]
 impl StorageBackend for FtpsBackend {
-    async fn upload(&self, source_path: &Path, dest_key: &str) -> Result<(), StorageError> {
+    async fn upload(
+        &self,
+        source_path: &Path,
+        dest_key: &str,
+        _ctx: &mut UploadContext,
+    ) -> Result<(), StorageError> {
         let mut conn = self.connect().await?;
         let remote = dest_key.to_string();
 
